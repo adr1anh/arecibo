@@ -36,7 +36,7 @@ use crate::{
 use abomonation::Abomonation;
 use abomonation_derive::Abomonation;
 use ff::{Field, PrimeField};
-use itertools::Itertools as _;
+use itertools::{chain, Itertools as _};
 use once_cell::sync::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -723,58 +723,64 @@ where
         evals_mem_preprocessed.iter()
       ),
       |Az_Bz_Cz_W_E, L_row_col, mem_oracles, mem_preprocessed| {
-        Az_Bz_Cz_W_E
-          .iter()
-          .chain(L_row_col)
-          .chain(mem_oracles)
-          .chain(mem_preprocessed)
-          .cloned()
-          .collect::<Vec<_>>()
+        chain![
+          Az_Bz_Cz_W_E.iter(),
+          L_row_col.iter(),
+          mem_oracles.iter(),
+          mem_preprocessed.iter()
+        ]
+        .cloned()
+        .collect::<Vec<_>>()
       }
     )
     .collect::<Vec<_>>();
 
-    let comms_vec = comms_Az_Bz_Cz
-      .iter()
-      .zip_eq(comms_W_E.iter())
-      .zip_eq(comms_L_row_col.iter())
-      .zip_eq(comms_mem_oracles.iter())
-      .zip_eq(pk.S_comm.iter())
-      .flat_map(
-        |((((Az_Bz_Cz, comms_W_E), L_row_col), mem_oracles), S_comm)| {
-          Az_Bz_Cz
-            .iter()
-            .chain(comms_W_E)
-            .chain(L_row_col)
-            .chain(mem_oracles)
-            .chain([
-              &S_comm.comm_val_A,
-              &S_comm.comm_val_B,
-              &S_comm.comm_val_C,
-              &S_comm.comm_row,
-              &S_comm.comm_col,
-              &S_comm.comm_ts_row,
-              &S_comm.comm_ts_col,
-            ])
-        },
-      )
-      .cloned()
-      .collect::<Vec<_>>();
+    let comms_vec = zip_with!(
+      (
+        comms_Az_Bz_Cz.iter(),
+        comms_W_E.iter(),
+        comms_L_row_col.iter(),
+        comms_mem_oracles.iter(),
+        pk.S_comm.iter()
+      ),
+      |Az_Bz_Cz, comms_W_E, L_row_col, mem_oracles, S_comm| {
+        chain![
+          Az_Bz_Cz,
+          comms_W_E,
+          L_row_col,
+          mem_oracles,
+          [
+            &S_comm.comm_val_A,
+            &S_comm.comm_val_B,
+            &S_comm.comm_val_C,
+            &S_comm.comm_row,
+            &S_comm.comm_col,
+            &S_comm.comm_ts_row,
+            &S_comm.comm_ts_col,
+          ]
+        ]
+      }
+    )
+    .flatten()
+    .cloned()
+    .collect::<Vec<_>>();
 
-    let w_vec = polys_Az_Bz_Cz
-      .into_iter()
-      .zip_eq(polys_W)
-      .zip_eq(polys_E)
-      .zip_eq(polys_L_row_col)
-      .zip_eq(polys_mem_oracles)
-      .zip_eq(pk.S_repr.iter())
-      .flat_map(|(((((Az_Bz_Cz, W), E), L_row_col), mem_oracles), S_repr)| {
-        Az_Bz_Cz
-          .into_iter()
-          .chain([W, E])
-          .chain(L_row_col)
-          .chain(mem_oracles)
-          .chain([
+    let w_vec = zip_with!(
+      (
+        polys_Az_Bz_Cz.into_iter(),
+        polys_W.into_iter(),
+        polys_E.into_iter(),
+        polys_L_row_col.into_iter(),
+        polys_mem_oracles.into_iter(),
+        pk.S_repr.iter()
+      ),
+      |Az_Bz_Cz, W, E, L_row_col, mem_oracles, S_repr| {
+        chain![
+          Az_Bz_Cz,
+          [W, E],
+          L_row_col,
+          mem_oracles,
+          [
             S_repr.val_A.clone(),
             S_repr.val_B.clone(),
             S_repr.val_C.clone(),
@@ -782,10 +788,13 @@ where
             S_repr.col.clone(),
             S_repr.ts_row.clone(),
             S_repr.ts_col.clone(),
-          ])
-      })
-      .map(|p| PolyEvalWitness::<E> { p })
-      .collect::<Vec<_>>();
+          ]
+        ]
+      }
+    )
+    .flatten()
+    .map(|p| PolyEvalWitness::<E> { p })
+    .collect::<Vec<_>>();
 
     evals_vec.iter().for_each(|evals| {
       transcript.absorb(b"e", &evals.as_slice()); // comm_vec is already in the transcript
@@ -839,6 +848,12 @@ where
 
   fn verify(&self, vk: &Self::VerifierKey, U: &[RelaxedR1CSInstance<E>]) -> Result<(), NovaError> {
     let num_instances = U.len();
+    let num_claims_per_instance = 10;
+
+    // number of rounds of sum-check
+    let num_rounds = vk.S_comm.iter().map(|s| s.N.log_2()).collect::<Vec<_>>();
+    let num_rounds_max = *num_rounds.iter().max().unwrap();
+
     let mut transcript = E::TE::new(b"BatchedRelaxedR1CSSNARK");
 
     transcript.absorb(b"vk", &vk.digest());
@@ -850,6 +865,7 @@ where
       transcript.absorb(b"U", u);
     });
 
+    // Decompress commitments
     let comms_Az_Bz_Cz = self
       .comms_Az_Bz_Cz
       .iter()
@@ -883,28 +899,28 @@ where
       })
       .collect::<Result<Vec<_>, _>>()?;
 
+    // Add commitments [Az, Bz, Cz] to the transcript
     comms_Az_Bz_Cz
       .iter()
       .for_each(|comms| transcript.absorb(b"c", &comms.as_slice()));
 
-    // number of rounds of sum-check
-    let num_rounds_sc = vk.S_comm.iter().map(|s| s.N.log_2()).max().unwrap();
     let tau = transcript.squeeze(b"t")?;
-    let tau_coords = PowPolynomial::new(&tau, num_rounds_sc).coordinates();
+    let tau_coords = PowPolynomial::new(&tau, num_rounds_max).coordinates();
 
     // absorb the claimed evaluations into the transcript
     self.evals_Az_Bz_Cz_at_tau.iter().for_each(|evals| {
       transcript.absorb(b"e", &evals.as_slice());
     });
 
+    // absorb commitments to L_row and L_col in the transcript
     comms_L_row_col.iter().for_each(|comms| {
-      // absorb commitments to L_row and L_col in the transcript
       transcript.absorb(b"e", &comms.as_slice());
     });
 
     // Batch at tau for each instance
     let c = transcript.squeeze(b"c")?;
 
+    // Compute eval_Mz = eval_Az_at_tau + c * eval_Bz_at_tau + c^2 * eval_Cz_at_tau
     let evals_Mz: Vec<_> = zip_with!(
       (comms_Az_Bz_Cz.iter(), self.evals_Az_Bz_Cz_at_tau.iter()),
       |comm_Az_Bz_Cz, evals_Az_Bz_Cz_at_tau| {
@@ -926,30 +942,44 @@ where
       transcript.absorb(b"l", &comms.as_slice());
     });
 
-    let num_claims = num_instances * 10;
-
     let rho = transcript.squeeze(b"r")?;
+
     let s = transcript.squeeze(b"r")?;
-    let coeffs = powers::<E>(&s, num_claims);
+    let s_powers = powers::<E>(&s, num_instances * num_claims_per_instance);
 
-    // Scale initial claims by 2^{log(N)-log(Ni)}
-    let claim = zip_with!(
-      (coeffs.chunks_exact(10), evals_Mz.iter(), vk.S_comm.iter()),
-      |coeffs, eval_Mz, s_comm| {
-        let scaling = 1 << (num_rounds_sc - s_comm.N.log_2()) as u64;
-        E::Scalar::from(scaling) * (coeffs[7] + coeffs[8]) * eval_Mz
-      }
-    )
-    .sum::<E::Scalar>();
+    let (claim_sc_final, rand_sc) = {
+      // Gather all claims into a single vector
+      let claims = evals_Mz
+        .iter()
+        .flat_map(|&eval_Mz| {
+          let mut claims = vec![E::Scalar::ZERO; num_claims_per_instance];
+          claims[7] = eval_Mz;
+          claims[8] = eval_Mz;
+          claims.into_iter()
+        })
+        .collect::<Vec<_>>();
 
-    // verify sc
-    let (claim_sc_final, rand_sc) = self.sc.verify(claim, num_rounds_sc, 3, &mut transcript)?;
+      // Number of rounds for each claim
+      let num_rounds_by_claim = num_rounds
+        .iter()
+        .flat_map(|num_rounds_i| vec![*num_rounds_i; num_claims_per_instance].into_iter())
+        .collect::<Vec<_>>();
+
+      self
+        .sc
+        .verify_batch(&claims, &num_rounds_by_claim, &s_powers, 3, &mut transcript)?
+    };
+
+    // Truncated sumcheck randomness for each instance
+    let rand_sc_i = num_rounds
+      .iter()
+      .map(|num_rounds| rand_sc[(num_rounds_max - num_rounds)..].to_vec())
+      .collect::<Vec<_>>();
 
     let claim_sc_final_expected = zip_with!(
       (
         vk.num_vars.iter(),
-        vk.S_comm.iter(),
-        coeffs.chunks_exact(10),
+        rand_sc_i.iter(),
         U.iter(),
         self.evals_Az_Bz_Cz_W_E.iter().cloned(),
         self.evals_L_row_col.iter().cloned(),
@@ -957,8 +987,7 @@ where
         self.evals_mem_preprocessed.iter().cloned()
       ),
       |num_vars,
-       s_comm,
-       coeffs,
+       rand_sc,
        U,
        evals_Az_Bz_Cz_W_E,
        evals_L_row_col,
@@ -970,10 +999,8 @@ where
           eval_mem_oracle;
         let [val_A, val_B, val_C, row, col, ts_row, ts_col] = eval_mem_preprocessed;
 
-        let num_rounds_i = s_comm.N.log_2();
+        let num_rounds_i = rand_sc.len();
         let num_vars_log = num_vars.log_2();
-        // Only consider the last log(Ni) rounds of Sumcheck
-        let (_, rand_sc) = rand_sc.split_at(num_rounds_sc - num_rounds_i);
 
         let eq_rho = {
           let rho_coords = PowPolynomial::new(&rho, num_rounds_i).coordinates();
@@ -1051,27 +1078,29 @@ where
           w + r
         };
 
-        let claim_mem_final_expected: E::Scalar = coeffs[0] * (t_plus_r_inv_row - w_plus_r_inv_row)
-          + coeffs[1] * (t_plus_r_inv_col - w_plus_r_inv_col)
-          + coeffs[2] * (eq_rho * (t_plus_r_inv_row * t_plus_r_row - ts_row))
-          + coeffs[3] * (eq_rho * (w_plus_r_inv_row * w_plus_r_row - E::Scalar::ONE))
-          + coeffs[4] * (eq_rho * (t_plus_r_inv_col * t_plus_r_col - ts_col))
-          + coeffs[5] * (eq_rho * (w_plus_r_inv_col * w_plus_r_col - E::Scalar::ONE));
+        let claims_mem = [
+          t_plus_r_inv_row - w_plus_r_inv_row,
+          t_plus_r_inv_col - w_plus_r_inv_col,
+          eq_rho * (t_plus_r_inv_row * t_plus_r_row - ts_row),
+          eq_rho * (w_plus_r_inv_row * w_plus_r_row - E::Scalar::ONE),
+          eq_rho * (t_plus_r_inv_col * t_plus_r_col - ts_col),
+          eq_rho * (w_plus_r_inv_col * w_plus_r_col - E::Scalar::ONE),
+        ];
 
-        let claim_outer_final_expected = coeffs[6] * eq_tau * (Az * Bz - U.u * Cz - E)
-          + coeffs[7] * eq_tau * (Az + c * Bz + c * c * Cz);
-        let claim_inner_final_expected =
-          coeffs[8] * L_row * L_col * (val_A + c * val_B + c * c * val_C);
+        let claims_outer = [
+          eq_tau * (Az * Bz - U.u * Cz - E),
+          eq_tau * (Az + c * Bz + c * c * Cz),
+        ];
+        let claims_inner = [L_row * L_col * (val_A + c * val_B + c * c * val_C)];
 
-        let claims_witness_final_expected = coeffs[9] * eq_masked_tau * W;
+        let claims_witness = [eq_masked_tau * W];
 
-        claim_mem_final_expected
-          + claim_outer_final_expected
-          + claim_inner_final_expected
-          + claims_witness_final_expected
+        chain![claims_mem, claims_outer, claims_inner, claims_witness]
       }
     )
-    .sum::<E::Scalar>();
+    .flatten()
+    .zip_eq(s_powers.into_iter())
+    .fold(E::Scalar::ZERO, |acc, (claim, s)| acc + s * claim);
 
     if claim_sc_final_expected != claim_sc_final {
       return Err(NovaError::InvalidSumcheckProof);
@@ -1085,71 +1114,65 @@ where
         self.evals_mem_preprocessed.iter()
       ),
       |Az_Bz_Cz_W_E, L_row_col, mem_oracles, mem_preprocessed| {
-        Az_Bz_Cz_W_E
-          .iter()
-          .chain(L_row_col)
-          .chain(mem_oracles)
-          .chain(mem_preprocessed)
+        chain![Az_Bz_Cz_W_E, L_row_col, mem_oracles, mem_preprocessed]
           .cloned()
           .collect::<Vec<_>>()
       }
     )
     .collect::<Vec<_>>();
 
-    let comms_vec = comms_Az_Bz_Cz
-      .iter()
-      .zip_eq(U.iter())
-      .zip_eq(comms_L_row_col.iter())
-      .zip_eq(comms_mem_oracles.iter())
-      .zip_eq(vk.S_comm.iter())
-      .flat_map(|((((Az_Bz_Cz, U), L_row_col), mem_oracles), S_comm)| {
-        Az_Bz_Cz
-          .iter()
-          .chain([&U.comm_W, &U.comm_E])
-          .chain(L_row_col)
-          .chain(mem_oracles)
-          .chain([
-            &S_comm.comm_val_A,
-            &S_comm.comm_val_B,
-            &S_comm.comm_val_C,
-            &S_comm.comm_row,
-            &S_comm.comm_col,
-            &S_comm.comm_ts_row,
-            &S_comm.comm_ts_col,
-          ])
-      })
-      .cloned()
-      .collect::<Vec<_>>();
-
+    // Add all Sumcheck evaluations to the transcript
     evals_vec.iter().for_each(|evals| {
       transcript.absorb(b"e", &evals.as_slice()); // comm_vec is already in the transcript
     });
 
-    // Rescale all evaluations by L_0(rand_sc_lo)
-    let evals_vec = evals_vec
-      .into_iter()
-      .zip_eq(vk.S_comm.iter())
-      .flat_map(|(evals, s_comm)| {
-        let Ni = s_comm.N;
-        let (rand_sc_lo, _) = rand_sc.split_at(num_rounds_sc - Ni.log_2());
-        let scaling = rand_sc_lo
-          .iter()
-          .fold(E::Scalar::ONE, |acc, r| acc * (E::Scalar::ONE - r));
-        evals.into_iter().map(move |eval| scaling * eval)
-      })
+    let c = transcript.squeeze(b"c")?;
+
+    // Compute batched polynomial evaluation instance at rand_sc
+    let u = {
+      let num_evals = evals_vec[0].len();
+
+      let evals_vec = evals_vec.into_iter().flatten().collect::<Vec<_>>();
+
+      let num_vars = num_rounds
+        .iter()
+        .flat_map(|num_rounds| vec![*num_rounds; num_evals].into_iter())
+        .collect::<Vec<_>>();
+
+      let comms_vec = zip_with!(
+        (
+          comms_Az_Bz_Cz.into_iter(),
+          U.iter(),
+          comms_L_row_col.into_iter(),
+          comms_mem_oracles.into_iter(),
+          vk.S_comm.iter()
+        ),
+        |Az_Bz_Cz, U, L_row_col, mem_oracles, S_comm| {
+          chain![
+            Az_Bz_Cz,
+            [U.comm_W, U.comm_E],
+            L_row_col,
+            mem_oracles,
+            [
+              S_comm.comm_val_A,
+              S_comm.comm_val_B,
+              S_comm.comm_val_C,
+              S_comm.comm_row,
+              S_comm.comm_col,
+              S_comm.comm_ts_row,
+              S_comm.comm_ts_col,
+            ]
+          ]
+        }
+      )
+      .flatten()
       .collect::<Vec<_>>();
 
-    let c = transcript.squeeze(b"c")?;
-    let u: PolyEvalInstance<E> = PolyEvalInstance::batch(&comms_vec, &rand_sc, &evals_vec, &c);
+      PolyEvalInstance::<E>::batch_diff_size(&comms_vec, &evals_vec, &num_vars, rand_sc, c)
+    };
+
     // verify
-    EE::verify(
-      &vk.vk_ee,
-      &mut transcript,
-      &u.c,
-      &rand_sc,
-      &u.e,
-      &self.eval_arg,
-    )?;
+    EE::verify(&vk.vk_ee, &mut transcript, &u.c, &u.x, &u.e, &self.eval_arg)?;
 
     Ok(())
   }
@@ -1218,44 +1241,36 @@ where
     T4: SumcheckEngine<E>,
   {
     // sanity checks
-    let num_instances = mem.len();
-    assert_eq!(outer.len(), num_instances);
-    assert_eq!(inner.len(), num_instances);
-    assert_eq!(witness.len(), num_instances);
-
-    mem.iter_mut().for_each(|inst| {
-      assert!(inst.size().is_power_of_two());
-    });
-    outer.iter().for_each(|inst| {
-      assert!(inst.size().is_power_of_two());
-    });
-    inner.iter().for_each(|inst| {
-      assert!(inst.size().is_power_of_two());
-    });
-    witness.iter().for_each(|inst| {
-      assert!(inst.size().is_power_of_two());
-    });
-
     let degree = mem[0].degree();
-    assert!(mem.iter().all(|inst| inst.degree() == degree));
-    assert!(outer.iter().all(|inst| inst.degree() == degree));
-    assert!(inner.iter().all(|inst| inst.degree() == degree));
-    assert!(witness.iter().all(|inst| inst.degree() == degree));
+    zip_with_for_each!(
+      (mem.iter(), outer.iter(), inner.iter(), witness.iter()),
+      |mem, outer, inner, witness| {
+        assert!(mem.size().is_power_of_two());
+        assert!(outer.size().is_power_of_two());
+        assert!(inner.size().is_power_of_two());
+        assert!(witness.size().is_power_of_two());
+
+        assert_eq!(mem.degree(), degree);
+        assert_eq!(outer.degree(), degree);
+        assert_eq!(inner.degree(), degree);
+        assert_eq!(witness.degree(), degree);
+      }
+    );
 
     // these claims are already added to the transcript, so we do not need to add
-    let claims = mem
-      .iter()
-      .zip_eq(outer.iter())
-      .zip_eq(inner.iter())
-      .zip_eq(witness.iter())
-      .flat_map(|(((mem, outer), inner), witness)| {
-        Self::scaled_claims(mem, num_rounds)
-          .into_iter()
-          .chain(Self::scaled_claims(outer, num_rounds))
-          .chain(Self::scaled_claims(inner, num_rounds))
-          .chain(Self::scaled_claims(witness, num_rounds))
-      })
-      .collect::<Vec<E::Scalar>>();
+    let claims = zip_with!(
+      (mem.iter(), outer.iter(), inner.iter(), witness.iter()),
+      |mem, outer, inner, witness| {
+        chain![
+          Self::scaled_claims(mem, num_rounds),
+          Self::scaled_claims(outer, num_rounds),
+          Self::scaled_claims(inner, num_rounds),
+          Self::scaled_claims(witness, num_rounds)
+        ]
+      }
+    )
+    .flatten()
+    .collect::<Vec<E::Scalar>>();
 
     let s = transcript.squeeze(b"r")?;
     let coeffs = powers::<E>(&s, claims.len());
@@ -1270,12 +1285,14 @@ where
     for i in 0..num_rounds {
       let remaining_variables = num_rounds - i;
 
-      let evals = mem
-        .par_iter()
-        .zip_eq(outer.par_iter())
-        .zip_eq(inner.par_iter())
-        .zip_eq(witness.par_iter())
-        .flat_map(|(((mem, outer), inner), witness)| {
+      let evals = zip_with!(
+        (
+          mem.par_iter(),
+          outer.par_iter(),
+          inner.par_iter(),
+          witness.par_iter()
+        ),
+        |mem, outer, inner, witness| {
           let ((evals_mem, evals_outer), (evals_inner, evals_witness)) = rayon::join(
             || {
               rayon::join(
@@ -1290,13 +1307,11 @@ where
               )
             },
           );
-          evals_mem
-            .into_par_iter()
-            .chain(evals_outer.into_par_iter())
-            .chain(evals_inner.into_par_iter())
-            .chain(evals_witness.into_par_iter())
-        })
-        .collect::<Vec<_>>();
+          chain![evals_mem, evals_outer, evals_inner, evals_witness]
+        }
+      )
+      .flatten()
+      .collect::<Vec<_>>();
 
       assert_eq!(evals.len(), claims.len());
 
@@ -1319,12 +1334,14 @@ where
       let r_i = transcript.squeeze(b"c")?;
       r.push(r_i);
 
-      mem
-        .par_iter_mut()
-        .zip_eq(outer.par_iter_mut())
-        .zip_eq(inner.par_iter_mut())
-        .zip_eq(witness.par_iter_mut())
-        .for_each(|(((mem, outer), inner), witness)| {
+      zip_with_for_each!(
+        (
+          mem.par_iter_mut(),
+          outer.par_iter_mut(),
+          inner.par_iter_mut(),
+          witness.par_iter_mut()
+        ),
+        |mem, outer, inner, witness| {
           rayon::join(
             || {
               rayon::join(
@@ -1339,7 +1356,8 @@ where
               )
             },
           );
-        });
+        }
+      );
 
       e = poly.evaluate(&r_i);
       cubic_polys.push(poly.compress());
